@@ -24,12 +24,17 @@
 package honker
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
 )
@@ -38,7 +43,9 @@ import (
 // loaded on every pool connection. Open() bootstraps the schema on
 // first use; safe to Open() the same path from multiple processes.
 type Database struct {
-	db *sql.DB
+	db      *sql.DB
+	dbPath  string
+	wal     *walWatcher
 }
 
 // driverCounter generates a unique sql.Register name per Open() so
@@ -93,11 +100,6 @@ PRAGMA wal_autocheckpoint = 10000;
 func Open(path string, extensionPath string) (*Database, error) {
 	n := driverCounter.Add(1)
 	driverName := fmt.Sprintf("sqlite3_honker_%d", n)
-	// go-sqlite3's `LoadExtension(path, "")` passes an empty cstring
-	// as the entry-point name to SQLite's `sqlite3_load_extension`,
-	// not NULL — so SQLite's default "derive sqlite3_<extname>_init
-	// from filename" path doesn't trigger. We replicate the derivation
-	// in Go and pass the explicit name.
 	entryPoint := deriveEntryPoint(extensionPath)
 
 	sql.Register(driverName, &sqlite3.SQLiteDriver{
@@ -128,16 +130,160 @@ func Open(path string, extensionPath string) (*Database, error) {
 		sqlDB.Close()
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
-	return &Database{db: sqlDB}, nil
+	d := &Database{db: sqlDB, dbPath: path}
+	d.wal = newWalWatcher(path)
+	return d, nil
 }
 
-// Close releases the underlying sql.DB.
-func (d *Database) Close() error { return d.db.Close() }
+// Close releases the underlying sql.DB and stops the WAL watcher.
+func (d *Database) Close() error {
+	if d.wal != nil {
+		d.wal.stop()
+	}
+	return d.db.Close()
+}
 
 // Raw returns the underlying *sql.DB for advanced queries (e.g.
 // reading _honker_live directly or integrating with Go migration
 // tools).
 func (d *Database) Raw() *sql.DB { return d.db }
+
+// -------------------------------------------------------------------
+// WAL watcher (internal)
+// -------------------------------------------------------------------
+
+type walWatcher struct {
+	mu     sync.Mutex
+	subs   map[uint64]chan struct{}
+	nextID uint64
+	done   chan struct{}
+	wg     sync.WaitGroup
+	dbPath string
+}
+
+func newWalWatcher(dbPath string) *walWatcher {
+	w := &walWatcher{
+		subs:   make(map[uint64]chan struct{}),
+		done:   make(chan struct{}),
+		dbPath: dbPath,
+	}
+	w.wg.Add(1)
+	go w.poll()
+	return w
+}
+
+func (w *walWatcher) subscribe() (uint64, <-chan struct{}) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	id := w.nextID
+	w.nextID++
+	ch := make(chan struct{}, 1)
+	w.subs[id] = ch
+	return id, ch
+}
+
+func (w *walWatcher) unsubscribe(id uint64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.subs, id)
+}
+
+func (w *walWatcher) stop() {
+	close(w.done)
+	w.wg.Wait()
+}
+
+func (w *walWatcher) poll() {
+	defer w.wg.Done()
+	walPath := w.dbPath + "-wal"
+	var lastSize int64
+	var lastMod time.Time
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-w.done:
+			return
+		case <-ticker.C:
+		}
+		info, err := os.Stat(walPath)
+		if err != nil {
+			continue
+		}
+		size := info.Size()
+		mod := info.ModTime()
+		if size != lastSize || !mod.Equal(lastMod) {
+			lastSize = size
+			lastMod = mod
+			w.mu.Lock()
+			for _, ch := range w.subs {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+			}
+			w.mu.Unlock()
+		}
+	}
+}
+
+// -------------------------------------------------------------------
+// Transactions
+// -------------------------------------------------------------------
+
+// Transaction is an open SQLite transaction. Call Commit or Rollback
+// to release; on drop without either, the transaction is rolled back
+// by the database (but explicit rollback is recommended).
+type Transaction struct {
+	tx *sql.Tx
+}
+
+// Begin starts a new transaction.
+func (d *Database) Begin() (*Transaction, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	return &Transaction{tx: tx}, nil
+}
+
+// Transaction starts a new transaction with context support.
+func (d *Database) Transaction(ctx context.Context) (*Transaction, error) {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &Transaction{tx: tx}, nil
+}
+
+// Exec runs a statement on the transaction.
+func (t *Transaction) Exec(sql string, args ...any) (sql.Result, error) {
+	return t.tx.Exec(sql, args...)
+}
+
+// QueryRow runs a query on the transaction and returns the first row.
+func (t *Transaction) QueryRow(sql string, args ...any) *sql.Row {
+	return t.tx.QueryRow(sql, args...)
+}
+
+// Commit commits the transaction.
+func (t *Transaction) Commit() error {
+	return t.tx.Commit()
+}
+
+// Rollback rolls back the transaction.
+func (t *Transaction) Rollback() error {
+	return t.tx.Rollback()
+}
+
+// Raw returns the underlying *sql.Tx for advanced use.
+func (t *Transaction) Raw() *sql.Tx {
+	return t.tx
+}
+
+// -------------------------------------------------------------------
+// Queue
+// -------------------------------------------------------------------
 
 // Queue returns a handle to a named queue. Opts are applied per-queue
 // (visibility timeout, max attempts). Zero values resolve to 300s /
@@ -187,6 +333,21 @@ func (q *Queue) Enqueue(payload any, opts EnqueueOptions) (int64, error) {
 	}
 	var id int64
 	err = q.db.db.QueryRow(
+		"SELECT honker_enqueue(?, ?, ?, ?, ?, ?, ?)",
+		q.name, string(js), opts.RunAt, opts.Delay, opts.Priority,
+		q.opts.MaxAttempts, opts.Expires,
+	).Scan(&id)
+	return id, err
+}
+
+// EnqueueTx inserts a new job inside an open transaction.
+func (q *Queue) EnqueueTx(tx *Transaction, payload any, opts EnqueueOptions) (int64, error) {
+	js, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("marshal payload: %w", err)
+	}
+	var id int64
+	err = tx.tx.QueryRow(
 		"SELECT honker_enqueue(?, ?, ?, ?, ?, ?, ?)",
 		q.name, string(js), opts.RunAt, opts.Delay, opts.Priority,
 		q.opts.MaxAttempts, opts.Expires,
@@ -289,6 +450,556 @@ func (j *Job) Heartbeat(extendSec int64) (bool, error) {
 	return n > 0, err
 }
 
+// AckBatch acks multiple jobs in one call. Returns count acked.
+func (q *Queue) AckBatch(ids []int64, workerID string) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	idsJSON, err := json.Marshal(ids)
+	if err != nil {
+		return 0, fmt.Errorf("marshal ids: %w", err)
+	}
+	var n int64
+	err = q.db.db.QueryRow(
+		"SELECT honker_ack_batch(?, ?)", string(idsJSON), workerID,
+	).Scan(&n)
+	return n, err
+}
+
+// SweepExpired moves expired pending rows to dead. Returns count moved.
+func (q *Queue) SweepExpired() (int64, error) {
+	var n int64
+	err := q.db.db.QueryRow(
+		"SELECT honker_sweep_expired(?)", q.name,
+	).Scan(&n)
+	return n, err
+}
+
+// ClaimWaker returns a waker that blocks on WAL commits until a job
+// is claimable.
+func (q *Queue) ClaimWaker() *ClaimWaker {
+	subID, ch := q.db.wal.subscribe()
+	return &ClaimWaker{
+		q:     q,
+		subID: subID,
+		walCh: ch,
+	}
+}
+
+// ClaimWaker blocks until a job is claimable, waking on WAL commits.
+type ClaimWaker struct {
+	q     *Queue
+	subID uint64
+	walCh <-chan struct{}
+}
+
+// Next blocks until a job is claimable, then claims and returns it.
+// Returns (nil, nil) if ctx is cancelled.
+func (w *ClaimWaker) Next(ctx context.Context, workerID string) (*Job, error) {
+	for {
+		job, err := w.q.ClaimOne(workerID)
+		if err != nil {
+			return nil, err
+		}
+		if job != nil {
+			return job, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil
+		case <-w.walCh:
+			// Recv-then-drain: coalesce bursts so we do one claim
+			// attempt per commit storm.
+			for {
+				select {
+				case <-w.walCh:
+				default:
+					goto drained
+				}
+			}
+		drained:
+		}
+	}
+}
+
+// Close unsubscribes from the WAL watcher.
+func (w *ClaimWaker) Close() {
+	w.q.db.wal.unsubscribe(w.subID)
+}
+
+// -------------------------------------------------------------------
+// Stream
+// -------------------------------------------------------------------
+
+// Stream returns a handle to a named stream.
+func (d *Database) Stream(name string) *Stream {
+	return &Stream{db: d, name: name}
+}
+
+// Stream is a named append-only event log with per-consumer offsets.
+type Stream struct {
+	db   *Database
+	name string
+}
+
+// StreamEvent is a single event in a stream.
+type StreamEvent struct {
+	Offset    int64
+	Topic     string
+	Key       *string
+	Payload   []byte
+	CreatedAt int64
+}
+
+// Publish inserts an event. Returns the assigned offset.
+func (s *Stream) Publish(payload any) (int64, error) {
+	return s.publishImpl(nil, payload)
+}
+
+// PublishWithKey publishes with a partition key.
+func (s *Stream) PublishWithKey(key string, payload any) (int64, error) {
+	return s.publishImpl(&key, payload)
+}
+
+// PublishTx publishes inside an open transaction.
+func (s *Stream) PublishTx(tx *Transaction, payload any) (int64, error) {
+	return s.publishTxImpl(tx, nil, payload)
+}
+
+func (s *Stream) publishImpl(key *string, payload any) (int64, error) {
+	js, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("marshal payload: %w", err)
+	}
+	var offset int64
+	err = s.db.db.QueryRow(
+		"SELECT honker_stream_publish(?, ?, ?)",
+		s.name, key, string(js),
+	).Scan(&offset)
+	return offset, err
+}
+
+func (s *Stream) publishTxImpl(tx *Transaction, key *string, payload any) (int64, error) {
+	js, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("marshal payload: %w", err)
+	}
+	var offset int64
+	err = tx.tx.QueryRow(
+		"SELECT honker_stream_publish(?, ?, ?)",
+		s.name, key, string(js),
+	).Scan(&offset)
+	return offset, err
+}
+
+// ReadSince reads up to limit events with offset strictly greater
+// than offset.
+func (s *Stream) ReadSince(offset int64, limit int) ([]StreamEvent, error) {
+	var rowsJSON string
+	err := s.db.db.QueryRow(
+		"SELECT honker_stream_read_since(?, ?, ?)",
+		s.name, offset, limit,
+	).Scan(&rowsJSON)
+	if err != nil {
+		return nil, err
+	}
+	return parseStreamEvents(rowsJSON)
+}
+
+// ReadFromConsumer reads from the saved offset of consumer.
+func (s *Stream) ReadFromConsumer(consumer string, limit int) ([]StreamEvent, error) {
+	offset, err := s.GetOffset(consumer)
+	if err != nil {
+		return nil, err
+	}
+	return s.ReadSince(offset, limit)
+}
+
+// SaveOffset persists a consumer's offset. Monotonic: lower offsets
+// are ignored. Returns true if the offset was advanced.
+func (s *Stream) SaveOffset(consumer string, offset int64) (bool, error) {
+	return s.saveOffsetImpl(consumer, offset, s.db.db)
+}
+
+// SaveOffsetTx saves offset inside an open transaction.
+func (s *Stream) SaveOffsetTx(tx *Transaction, consumer string, offset int64) (bool, error) {
+	return s.saveOffsetImpl(consumer, offset, tx.tx)
+}
+
+func (s *Stream) saveOffsetImpl(consumer string, offset int64, executor queryRower) (bool, error) {
+	var n int64
+	err := executor.QueryRow(
+		"SELECT honker_stream_save_offset(?, ?, ?)",
+		consumer, s.name, offset,
+	).Scan(&n)
+	return n > 0, err
+}
+
+// GetOffset returns the current saved offset for consumer, or 0.
+func (s *Stream) GetOffset(consumer string) (int64, error) {
+	var offset int64
+	err := s.db.db.QueryRow(
+		"SELECT honker_stream_get_offset(?, ?)",
+		consumer, s.name,
+	).Scan(&offset)
+	return offset, err
+}
+
+// Subscribe returns a channel of stream events for a named consumer.
+// Resumes from saved offset, wakes on WAL commits, auto-saves offset
+// every 1000 events. Close on ctx cancel.
+func (s *Stream) Subscribe(ctx context.Context, consumer string) <-chan StreamEvent {
+	ch := make(chan StreamEvent, 16)
+	go s.subscribeLoop(ctx, consumer, ch)
+	return ch
+}
+
+func (s *Stream) subscribeLoop(ctx context.Context, consumer string, ch chan<- StreamEvent) {
+	defer close(ch)
+	offset, err := s.GetOffset(consumer)
+	if err != nil {
+		return
+	}
+	lastSaved := offset
+	subID, walCh := s.db.wal.subscribe()
+	defer s.db.wal.unsubscribe(subID)
+
+	for {
+		events, err := s.ReadSince(offset, 100)
+		if err != nil {
+			return
+		}
+		for _, ev := range events {
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- ev:
+			}
+			offset = ev.Offset
+			if offset-lastSaved >= 1000 {
+				_, _ = s.SaveOffset(consumer, offset)
+				lastSaved = offset
+			}
+		}
+		if len(events) > 0 {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-walCh:
+			for {
+				select {
+				case <-walCh:
+				default:
+					goto drained
+				}
+			}
+		drained:
+		}
+	}
+}
+
+func parseStreamEvents(rowsJSON string) ([]StreamEvent, error) {
+	var raw []struct {
+		Offset    int64   `json:"offset"`
+		Topic     string  `json:"topic"`
+		Key       *string `json:"key"`
+		Payload   string  `json:"payload"`
+		CreatedAt int64   `json:"created_at"`
+	}
+	if err := json.Unmarshal([]byte(rowsJSON), &raw); err != nil {
+		return nil, fmt.Errorf("unmarshal stream events: %w", err)
+	}
+	events := make([]StreamEvent, len(raw))
+	for i, r := range raw {
+		events[i] = StreamEvent{
+			Offset:    r.Offset,
+			Topic:     r.Topic,
+			Key:       r.Key,
+			Payload:   []byte(r.Payload),
+			CreatedAt: r.CreatedAt,
+		}
+	}
+	return events, nil
+}
+
+// -------------------------------------------------------------------
+// Scheduler
+// -------------------------------------------------------------------
+
+// Scheduler returns a scheduler facade.
+func (d *Database) Scheduler() *Scheduler {
+	return &Scheduler{db: d}
+}
+
+// Scheduler manages cron-scheduled tasks with leader election.
+type Scheduler struct {
+	db *Database
+}
+
+// ScheduledTask is a periodic task registration.
+type ScheduledTask struct {
+	Name     string
+	Queue    string
+	Cron     string
+	Payload  any
+	Priority int64
+	ExpiresS *int64
+}
+
+// ScheduledFire is one firing of a scheduled task.
+type ScheduledFire struct {
+	Name   string `json:"name"`
+	Queue  string `json:"queue"`
+	FireAt int64  `json:"fire_at"`
+	JobID  int64  `json:"job_id"`
+}
+
+// Add registers a cron task. Idempotent by name.
+func (s *Scheduler) Add(task ScheduledTask) error {
+	payloadJSON, err := json.Marshal(task.Payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+	_, err = s.db.db.Exec(
+		"SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
+		task.Name, task.Queue, task.Cron, string(payloadJSON),
+		task.Priority, task.ExpiresS,
+	)
+	return err
+}
+
+// Remove unregisters a task by name. Returns rows deleted.
+func (s *Scheduler) Remove(name string) (int64, error) {
+	var n int64
+	err := s.db.db.QueryRow(
+		"SELECT honker_scheduler_unregister(?)", name,
+	).Scan(&n)
+	return n, err
+}
+
+// Tick fires due boundaries and returns what was enqueued.
+func (s *Scheduler) Tick() ([]ScheduledFire, error) {
+	now := time.Now().Unix()
+	var rowsJSON string
+	err := s.db.db.QueryRow(
+		"SELECT honker_scheduler_tick(?)", now,
+	).Scan(&rowsJSON)
+	if err != nil {
+		return nil, err
+	}
+	var fires []ScheduledFire
+	if err := json.Unmarshal([]byte(rowsJSON), &fires); err != nil {
+		return nil, fmt.Errorf("unmarshal fires: %w", err)
+	}
+	return fires, nil
+}
+
+// Soonest returns the soonest next_fire_at across all tasks, or 0.
+func (s *Scheduler) Soonest() (int64, error) {
+	var ts int64
+	err := s.db.db.QueryRow(
+		"SELECT honker_scheduler_soonest()",
+	).Scan(&ts)
+	return ts, err
+}
+
+// Run is a blocking leader-elected loop. Only the lock holder fires
+// ticks. Exits when ctx is cancelled.
+func (s *Scheduler) Run(ctx context.Context, owner string) error {
+	const lockTTL = 60
+	const heartbeatInterval = 20 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		lock, err := s.db.TryLock("honker-scheduler", owner, lockTTL)
+		if err != nil {
+			return err
+		}
+		if lock == nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+
+		err = s.leaderLoop(ctx, lock, owner, lockTTL, heartbeatInterval)
+		_ = lock.Release()
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (s *Scheduler) leaderLoop(ctx context.Context, lock *Lock, owner string, lockTTL int64, heartbeatInterval time.Duration) error {
+	lastHeartbeat := time.Now()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+
+		_, err := s.Tick()
+		if err != nil {
+			return err
+		}
+
+		if time.Since(lastHeartbeat) >= heartbeatInterval {
+			ok, err := lock.Heartbeat(lockTTL)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				// Lost the lock — exit leader loop and re-contest.
+				return nil
+			}
+			lastHeartbeat = time.Now()
+		}
+	}
+}
+
+// -------------------------------------------------------------------
+// Locks
+// -------------------------------------------------------------------
+
+// TryLock attempts to acquire an advisory lock. Returns nil if not
+// acquired.
+func (d *Database) TryLock(name, owner string, ttlSec int64) (*Lock, error) {
+	var n int64
+	err := d.db.QueryRow(
+		"SELECT honker_lock_acquire(?, ?, ?)", name, owner, ttlSec,
+	).Scan(&n)
+	if err != nil {
+		return nil, err
+	}
+	if n != 1 {
+		return nil, nil
+	}
+	lock := &Lock{db: d, name: name, owner: owner}
+	runtime.SetFinalizer(lock, (*Lock).finalize)
+	return lock, nil
+}
+
+// Lock is a held advisory lock.
+type Lock struct {
+	db       *Database
+	name     string
+	owner    string
+	released bool
+}
+
+// Release releases the lock. Idempotent.
+func (l *Lock) Release() error {
+	if l.released {
+		return nil
+	}
+	l.released = true
+	runtime.SetFinalizer(l, nil)
+	_, err := l.db.db.Exec(
+		"SELECT honker_lock_release(?, ?)", l.name, l.owner,
+	)
+	return err
+}
+
+// Heartbeat extends the lock's TTL. Returns true if we still own it.
+// Uses a direct UPDATE because honker_lock_acquire uses INSERT OR
+// IGNORE and won't extend an existing row.
+func (l *Lock) Heartbeat(ttlSec int64) (bool, error) {
+	tx, err := l.db.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(
+		"UPDATE _honker_locks SET expires_at = unixepoch() + ? WHERE name = ? AND owner = ?",
+		ttlSec, l.name, l.owner,
+	)
+	if err != nil {
+		return false, err
+	}
+	var changes int64
+	if err := tx.QueryRow("SELECT changes()").Scan(&changes); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return changes > 0, nil
+}
+
+func (l *Lock) finalize() {
+	if l.released {
+		return
+	}
+	l.released = true
+	if l.db != nil && l.db.db != nil {
+		_, _ = l.db.db.Exec(
+			"SELECT honker_lock_release(?, ?)", l.name, l.owner,
+		)
+	}
+}
+
+// -------------------------------------------------------------------
+// Rate limiting
+// -------------------------------------------------------------------
+
+// TryRateLimit performs a fixed-window rate limit check. Returns true
+// if the request is allowed.
+func (d *Database) TryRateLimit(name string, limit, perSec int64) (bool, error) {
+	var n int64
+	err := d.db.QueryRow(
+		"SELECT honker_rate_limit_try(?, ?, ?)", name, limit, perSec,
+	).Scan(&n)
+	return n == 1, err
+}
+
+// -------------------------------------------------------------------
+// Results
+// -------------------------------------------------------------------
+
+// SaveResult persists a job result.
+func (d *Database) SaveResult(jobID int64, value string, ttlSec int64) error {
+	_, err := d.db.Exec(
+		"SELECT honker_result_save(?, ?, ?)", jobID, value, ttlSec,
+	)
+	return err
+}
+
+// GetResult fetches a stored result. Returns nil if absent or expired.
+func (d *Database) GetResult(jobID int64) (*string, error) {
+	var value *string
+	err := d.db.QueryRow(
+		"SELECT honker_result_get(?)", jobID,
+	).Scan(&value)
+	return value, err
+}
+
+// SweepResults drops expired results. Returns rows deleted.
+func (d *Database) SweepResults() (int64, error) {
+	var n int64
+	err := d.db.QueryRow(
+		"SELECT honker_result_sweep()",
+	).Scan(&n)
+	return n, err
+}
+
+// -------------------------------------------------------------------
+// Notify / Listen
+// -------------------------------------------------------------------
+
 // Notify fires a pub/sub signal on channel. Payload is marshaled via
 // json.Marshal. Returns the notification id.
 func (d *Database) Notify(channel string, payload any) (int64, error) {
@@ -299,4 +1010,90 @@ func (d *Database) Notify(channel string, payload any) (int64, error) {
 	var id int64
 	err = d.db.QueryRow("SELECT notify(?, ?)", channel, string(js)).Scan(&id)
 	return id, err
+}
+
+// NotifyTx fires a notification inside an open transaction.
+func (d *Database) NotifyTx(tx *Transaction, channel string, payload any) (int64, error) {
+	js, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("marshal payload: %w", err)
+	}
+	var id int64
+	err = tx.tx.QueryRow("SELECT notify(?, ?)", channel, string(js)).Scan(&id)
+	return id, err
+}
+
+// Notification is a pub/sub message.
+type Notification struct {
+	ID      int64
+	Channel string
+	Payload []byte
+}
+
+// Listen returns a channel of notifications on channel. Starts at
+// MAX(id) at attach time; historical notifications are not replayed.
+// Close on ctx cancel.
+func (d *Database) Listen(ctx context.Context, channel string) <-chan Notification {
+	ch := make(chan Notification, 16)
+	go d.listenLoop(ctx, channel, ch)
+	return ch
+}
+
+func (d *Database) listenLoop(ctx context.Context, channel string, ch chan<- Notification) {
+	defer close(ch)
+	var lastID int64
+	row := d.db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM _honker_notifications")
+	if err := row.Scan(&lastID); err != nil {
+		return
+	}
+
+	subID, walCh := d.wal.subscribe()
+	defer d.wal.unsubscribe(subID)
+
+	for {
+		rows, err := d.db.Query(
+			"SELECT id, channel, payload FROM _honker_notifications WHERE id > ? AND channel = ? ORDER BY id ASC LIMIT 1000",
+			lastID, channel,
+		)
+		if err != nil {
+			return
+		}
+		for rows.Next() {
+			var n Notification
+			if err := rows.Scan(&n.ID, &n.Channel, &n.Payload); err != nil {
+				rows.Close()
+				return
+			}
+			lastID = n.ID
+			select {
+			case <-ctx.Done():
+				rows.Close()
+				return
+			case ch <- n:
+			}
+		}
+		rows.Close()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-walCh:
+			for {
+				select {
+				case <-walCh:
+				default:
+					goto drained
+				}
+			}
+		drained:
+		}
+	}
+}
+
+// -------------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------------
+
+type queryRower interface {
+	QueryRow(query string, args ...any) *sql.Row
 }
