@@ -131,7 +131,7 @@ func Open(path string, extensionPath string) (*Database, error) {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
 	d := &Database{db: sqlDB, dbPath: path}
-	d.wal = newWalWatcher(path)
+	d.wal = newWalWatcher(sqlDB, path)
 	return d, nil
 }
 
@@ -149,8 +149,19 @@ func (d *Database) Close() error {
 func (d *Database) Raw() *sql.DB { return d.db }
 
 // -------------------------------------------------------------------
-// WAL watcher (internal)
+// Database commit watcher (internal)
 // -------------------------------------------------------------------
+
+// fileIdentity returns a platform-specific (dev, ino) tuple for the
+// given path. Used to detect when the database file has been replaced
+// underneath us (atomic rename, litestream restore, volume remount).
+func fileIdentity(path string) (uint64, uint64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	return statDevIno(info)
+}
 
 type walWatcher struct {
 	mu     sync.Mutex
@@ -158,13 +169,15 @@ type walWatcher struct {
 	nextID uint64
 	done   chan struct{}
 	wg     sync.WaitGroup
+	db     *sql.DB
 	dbPath string
 }
 
-func newWalWatcher(dbPath string) *walWatcher {
+func newWalWatcher(db *sql.DB, dbPath string) *walWatcher {
 	w := &walWatcher{
 		subs:   make(map[uint64]chan struct{}),
 		done:   make(chan struct{}),
+		db:     db,
 		dbPath: dbPath,
 	}
 	w.wg.Add(1)
@@ -195,34 +208,61 @@ func (w *walWatcher) stop() {
 
 func (w *walWatcher) poll() {
 	defer w.wg.Done()
-	walPath := w.dbPath + "-wal"
-	var lastSize int64
-	var lastMod time.Time
+
+	initDev, initIno, _ := fileIdentity(w.dbPath)
+	var lastVersion uint32
+	// Seed initial data_version.
+	_ = w.db.QueryRow("PRAGMA data_version").Scan(&lastVersion)
+
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
+	var tick uint64
 	for {
 		select {
 		case <-w.done:
 			return
 		case <-ticker.C:
 		}
-		info, err := os.Stat(walPath)
-		if err != nil {
+
+		// Path 1: PRAGMA data_version (fast path)
+		var version uint32
+		if err := w.db.QueryRow("PRAGMA data_version").Scan(&version); err != nil {
+			// Transient failure (connection pool will retry next tick).
+			// Force one conservative wake.
+			w.fire()
 			continue
 		}
-		size := info.Size()
-		mod := info.ModTime()
-		if size != lastSize || !mod.Equal(lastMod) {
-			lastSize = size
-			lastMod = mod
-			w.mu.Lock()
-			for _, ch := range w.subs {
-				select {
-				case ch <- struct{}{}:
-				default:
-				}
+		if version != lastVersion {
+			lastVersion = version
+			w.fire()
+		}
+
+		// Path 2: stat identity check (dead-man's switch)
+		tick++
+		if tick%100 == 0 {
+			dev, ino, err := fileIdentity(w.dbPath)
+			if err != nil {
+				// File vanished — force wake, let caller recover.
+				w.fire()
+				continue
 			}
-			w.mu.Unlock()
+			if dev != initDev || ino != initIno {
+				panic(fmt.Sprintf(
+					"honker: database file replaced: expected (dev=%d, ino=%d), found (dev=%d, ino=%d) at %s. Restart required.",
+					initDev, initIno, dev, ino, w.dbPath,
+				))
+			}
+		}
+	}
+}
+
+func (w *walWatcher) fire() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, ch := range w.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
 		}
 	}
 }
