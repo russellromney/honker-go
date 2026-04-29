@@ -102,15 +102,21 @@ Extends the claim's visibility timeout for long-running jobs.
 
 ### `(*Database).Notify(channel string, payload any) (int64, error)`
 
-Fires a `pg_notify`-style pub/sub signal. Other processes listening on the same channel wake within the stat-poll cadence.
+Fires a `pg_notify`-style pub/sub signal. Other processes listening on the same channel wake within the update watcher cadence.
 
-## What's not here yet
+### `(*Database).Listen(ctx context.Context, channel string) <-chan Notification`
 
-- `Listen` / `.db-wal` watcher async API (use `SELECT id, channel, payload FROM _honker_notifications WHERE id > ? ORDER BY id` polling for now)
-- Streams (durable pub/sub with per-consumer offsets)
-- Scheduler (cron-style periodic tasks)
+Subscribes to non-durable notifications from the current high-water mark.
 
-All of those are available via raw SQL on the same database — `SELECT honker_stream_publish(...)` etc. work from Go via `db.Raw().Exec(...)`. They'll be wrapped in idiomatic Go APIs in a future release.
+### `(*Database).Stream(name string) *Stream`
+
+Durable pub/sub with per-consumer offsets.
+
+### `(*Database).Scheduler() *Scheduler`
+
+Cron-style periodic tasks.
+
+The underlying SQLite handle is also available through `db.Raw()` for direct SQL access.
 
 ## Testing
 

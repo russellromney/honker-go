@@ -19,7 +19,7 @@ func TestTransactionAtomicity(t *testing.T) {
 
 	q := db.Queue("txq", QueueOptions{})
 
-		tx, err := db.Begin()
+	tx, err := db.Begin()
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestTransactionAtomicity(t *testing.T) {
 		t.Fatalf("expected no job after rollback, got %d", job.ID)
 	}
 
-		tx2, err := db.Begin()
+	tx2, err := db.Begin()
 	if err != nil {
 		t.Fatalf("begin2: %v", err)
 	}
