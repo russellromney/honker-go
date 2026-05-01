@@ -1,6 +1,11 @@
 # honker-go
 
-Go binding for [Honker](https://honker.dev) — durable queues, streams, pub/sub, and scheduler on SQLite.
+Go binding for [Honker](https://github.com/russellromney/honker): durable queues, streams, pub/sub, and time-trigger scheduling on SQLite.
+
+Full docs:
+
+- [Main repo](https://github.com/russellromney/honker)
+- [Docs](https://honker.dev)
 
 ## Install
 
@@ -8,127 +13,49 @@ Go binding for [Honker](https://honker.dev) — durable queues, streams, pub/sub
 go get github.com/russellromney/honker-go
 ```
 
-You'll also need the Honker SQLite extension (`libhonker.dylib` on macOS, `libhonker.so` on Linux). Prebuilds live at [GitHub releases](https://github.com/russellromney/honker/releases/latest), or build from source:
-
-```bash
-git clone https://github.com/russellromney/honker
-cd honker
-cargo build --release -p honker-extension
-# → target/release/libhonker_extension.{dylib,so}
-```
-
-## Build requirement
-
-This binding uses [mattn/go-sqlite3](https://github.com/mattn/go-sqlite3), which requires cgo and the `sqlite_load_extension` build tag to enable `LoadExtension`:
-
-```bash
-go build -tags sqlite_load_extension ./...
-go test  -tags sqlite_load_extension ./...
-```
+You also need the Honker SQLite extension from the main repo.
 
 ## Quick start
 
 ```go
-package main
+db, err := honker.Open("app.db", honker.WithExtensionPath("./libhonker_ext.dylib"))
+if err != nil {
+    panic(err)
+}
 
-import (
-    "encoding/json"
-    "fmt"
-    "log"
+q := db.Queue("emails")
 
-    "github.com/russellromney/honker-go"
-)
+if _, err := q.Enqueue(map[string]any{"to": "alice@example.com"}); err != nil {
+    panic(err)
+}
 
-func main() {
-    db, err := honker.Open("app.db", "./libhonker_extension.dylib")
-    if err != nil { log.Fatal(err) }
-    defer db.Close()
-
-    q := db.Queue("emails", honker.QueueOptions{})
-
-    // Enqueue
-    _, err = q.Enqueue(map[string]any{"to": "alice@example.com"}, honker.EnqueueOptions{})
-    if err != nil { log.Fatal(err) }
-
-    // Claim + process + ack
-    job, err := q.ClaimOne("worker-1")
-    if err != nil { log.Fatal(err) }
-
-    var body map[string]any
-    json.Unmarshal(job.Payload, &body)
-    fmt.Printf("sending to %s\n", body["to"])
-
-    if _, err := job.Ack(); err != nil { log.Fatal(err) }
+job, err := q.ClaimOne("worker-1")
+if err != nil {
+    panic(err)
+}
+if job != nil {
+    sendEmail(job.Payload)
+    _ = job.Ack()
 }
 ```
 
-## API
+Delayed jobs use `RunAt`:
 
-### `Open(path, extensionPath string) (*Database, error)`
-
-Opens (or creates) a SQLite database, loads the Honker extension on every pooled connection, applies default PRAGMAs, and bootstraps the schema.
-
-### `(*Database).Queue(name, QueueOptions) *Queue`
-
-Handle to a named queue. `QueueOptions{VisibilityTimeoutS, MaxAttempts}` — zero values resolve to 300s / 3 attempts.
-
-### `(*Queue).Enqueue(payload any, EnqueueOptions) (int64, error)`
-
-Inserts a job. `payload` is marshaled via `json.Marshal`. `EnqueueOptions{Delay, RunAt, Priority, Expires}` — all optional, `Delay` / `RunAt` / `Expires` are `*int64` so you can distinguish unset from zero.
-
-### `(*Queue).ClaimBatch(workerID string, n int) ([]*Job, error)`
-
-Atomically claims up to N jobs. Returns empty slice if queue is empty.
-
-### `(*Queue).ClaimOne(workerID string) (*Job, error)`
-
-Claims a single job or returns `(nil, nil)` on empty.
-
-### `(*Job).Ack() (bool, error)`
-
-Deletes the claim row. Returns `(true, nil)` iff the caller's claim hadn't expired.
-
-### `(*Job).Retry(delaySec int64, errMsg string) (bool, error)`
-
-Puts the job back with a delay. After `MaxAttempts`, moves to `_honker_dead`.
-
-### `(*Job).Fail(errMsg string) (bool, error)`
-
-Unconditionally moves to `_honker_dead`.
-
-### `(*Job).Heartbeat(extendSec int64) (bool, error)`
-
-Extends the claim's visibility timeout for long-running jobs.
-
-### `(*Database).Notify(channel string, payload any) (int64, error)`
-
-Fires a `pg_notify`-style pub/sub signal. Other processes listening on the same channel wake within the update watcher cadence.
-
-### `(*Database).Listen(ctx context.Context, channel string) <-chan Notification`
-
-Subscribes to non-durable notifications from the current high-water mark.
-
-### `(*Database).Stream(name string) *Stream`
-
-Durable pub/sub with per-consumer offsets.
-
-### `(*Database).Scheduler() *Scheduler`
-
-Recurring schedules. Use the `Schedule` field for:
-
-- 5-field cron
-- 6-field cron
-- `@every <n><unit>` like `@every 1s`
-
-The underlying SQLite handle is also available through `db.Raw()` for direct SQL access.
-
-## Testing
-
-```bash
-# Build the extension first
-cd /path/to/honker && cargo build --release -p honker-extension
-
-# Then run Go tests
-cd packages/honker-go
-go test -tags sqlite_load_extension -v ./...
+```go
+_, _ = q.Enqueue(map[string]any{"to": "later@example.com"}, honker.RunAt(time.Now().Unix()+10))
 ```
+
+Recurring schedules use `Schedule`:
+
+```go
+s := db.Scheduler()
+_ = s.Add("fast", "emails", "@every 1s", map[string]any{"kind": "tick"})
+```
+
+Supported schedule forms:
+
+- `0 3 * * *`
+- `*/2 * * * * *`
+- `@every 1s`
+
+`Schedule` is the canonical recurring-schedule name. Older `Cron` naming is compatibility-only.
