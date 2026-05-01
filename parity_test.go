@@ -19,7 +19,7 @@ func TestTransactionAtomicity(t *testing.T) {
 
 	q := db.Queue("txq", QueueOptions{})
 
-		tx, err := db.Begin()
+	tx, err := db.Begin()
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestTransactionAtomicity(t *testing.T) {
 		t.Fatalf("expected no job after rollback, got %d", job.ID)
 	}
 
-		tx2, err := db.Begin()
+	tx2, err := db.Begin()
 	if err != nil {
 		t.Fatalf("begin2: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestScheduler(t *testing.T) {
 	sched := db.Scheduler()
 
 	if err := sched.Add(ScheduledTask{
-		Name: "test", Queue: "q", Cron: "0 * * * *",
+		Name: "test", Queue: "q", Schedule: "0 * * * *",
 		Payload: map[string]any{"x": 1}, Priority: 0,
 	}); err != nil {
 		t.Fatalf("add: %v", err)
@@ -341,7 +341,7 @@ func TestSchedulerRun(t *testing.T) {
 
 	sched := db.Scheduler()
 	if err := sched.Add(ScheduledTask{
-		Name: "runtest", Queue: "q", Cron: "0 * * * *",
+		Name: "runtest", Queue: "q", Schedule: "0 * * * *",
 		Payload: map[string]any{"x": 1},
 	}); err != nil {
 		t.Fatalf("add: %v", err)
@@ -353,6 +353,32 @@ func TestSchedulerRun(t *testing.T) {
 	err = sched.Run(ctx, "owner-1")
 	if err != context.DeadlineExceeded {
 		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+}
+
+func TestSchedulerAcceptsLegacyCronAlias(t *testing.T) {
+	extPath := findExtension(t)
+	dbPath := filepath.Join(t.TempDir(), "t.db")
+	db, err := Open(dbPath, extPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	sched := db.Scheduler()
+	if err := sched.Add(ScheduledTask{
+		Name: "legacy", Queue: "q", Cron: "@every 1s",
+		Payload: map[string]any{"ok": true},
+	}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	soonest, err := sched.Soonest()
+	if err != nil {
+		t.Fatalf("soonest: %v", err)
+	}
+	if soonest == 0 {
+		t.Fatal("expected non-zero soonest")
 	}
 }
 
@@ -594,6 +620,89 @@ func TestClaimWaker(t *testing.T) {
 		job.Ack()
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for waker")
+	}
+}
+
+func TestClaimWakerWakesOnRunAtDeadline(t *testing.T) {
+	extPath := findExtension(t)
+	dbPath := filepath.Join(t.TempDir(), "t.db")
+	db, err := Open(dbPath, extPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	q := db.Queue("runat", QueueOptions{})
+	runAt := time.Now().Add(2 * time.Second).Unix()
+	if _, err := q.Enqueue(map[string]any{"x": 1}, EnqueueOptions{RunAt: &runAt}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	waker := q.ClaimWaker()
+	defer waker.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	job, err := waker.Next(ctx, "worker-1")
+	if err != nil {
+		t.Fatalf("waker next: %v", err)
+	}
+	if job == nil {
+		t.Fatal("expected job from waker")
+	}
+	elapsed := time.Since(start)
+	expected := time.Until(time.Unix(runAt, 0))
+	minElapsed := expected - 250*time.Millisecond
+	if minElapsed < 0 {
+		minElapsed = 0
+	}
+	if elapsed < minElapsed {
+		t.Fatalf("run_at wake came too early: %v (expected about %v)", elapsed, expected)
+	}
+	if elapsed > expected+2500*time.Millisecond {
+		t.Fatalf("run_at wake came too late: %v (expected about %v)", elapsed, expected)
+	}
+	job.Ack()
+}
+
+func TestSchedulerAcceptsEverySecondExpression(t *testing.T) {
+	extPath := findExtension(t)
+	dbPath := filepath.Join(t.TempDir(), "t.db")
+	db, err := Open(dbPath, extPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	sched := db.Scheduler()
+	if err := sched.Add(ScheduledTask{
+		Name:     "fast",
+		Queue:    "beats",
+		Schedule: "@every 1s",
+		Payload: map[string]any{"ok": true},
+	}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	soonest, err := sched.Soonest()
+	if err != nil {
+		t.Fatalf("soonest: %v", err)
+	}
+	if soonest == 0 {
+		t.Fatal("expected non-zero soonest")
+	}
+
+	var rowsJSON string
+	if err := db.Raw().QueryRow("SELECT honker_scheduler_tick(?)", soonest).Scan(&rowsJSON); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	var fires []ScheduledFire
+	if err := json.Unmarshal([]byte(rowsJSON), &fires); err != nil {
+		t.Fatalf("unmarshal fires: %v", err)
+	}
+	if len(fires) != 1 {
+		t.Fatalf("expected 1 fire, got %d", len(fires))
 	}
 }
 

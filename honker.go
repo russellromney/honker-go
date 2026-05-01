@@ -45,7 +45,7 @@ import (
 type Database struct {
 	db      *sql.DB
 	dbPath  string
-	wal     *walWatcher
+	updates *updateWatcher
 }
 
 // driverCounter generates a unique sql.Register name per Open() so
@@ -131,14 +131,18 @@ func Open(path string, extensionPath string) (*Database, error) {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
 	d := &Database{db: sqlDB, dbPath: path}
-	d.wal = newWalWatcher(sqlDB, path)
+	d.updates, err = newUpdateWatcher(driverName, path)
+	if err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("update watcher: %w", err)
+	}
 	return d, nil
 }
 
-// Close releases the underlying sql.DB and stops the WAL watcher.
+// Close releases the underlying sql.DB and stops the update watcher.
 func (d *Database) Close() error {
-	if d.wal != nil {
-		d.wal.stop()
+	if d.updates != nil {
+		d.updates.stop()
 	}
 	return d.db.Close()
 }
@@ -163,7 +167,7 @@ func fileIdentity(path string) (uint64, uint64, error) {
 	return statDevIno(info)
 }
 
-type walWatcher struct {
+type updateWatcher struct {
 	mu     sync.Mutex
 	subs   map[uint64]chan struct{}
 	nextID uint64
@@ -173,8 +177,16 @@ type walWatcher struct {
 	dbPath string
 }
 
-func newWalWatcher(db *sql.DB, dbPath string) *walWatcher {
-	w := &walWatcher{
+func newUpdateWatcher(driverName string, dbPath string) (*updateWatcher, error) {
+	db, err := sql.Open(driverName, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	w := &updateWatcher{
 		subs:   make(map[uint64]chan struct{}),
 		done:   make(chan struct{}),
 		db:     db,
@@ -182,10 +194,10 @@ func newWalWatcher(db *sql.DB, dbPath string) *walWatcher {
 	}
 	w.wg.Add(1)
 	go w.poll()
-	return w
+	return w, nil
 }
 
-func (w *walWatcher) subscribe() (uint64, <-chan struct{}) {
+func (w *updateWatcher) subscribe() (uint64, <-chan struct{}) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	id := w.nextID
@@ -195,18 +207,19 @@ func (w *walWatcher) subscribe() (uint64, <-chan struct{}) {
 	return id, ch
 }
 
-func (w *walWatcher) unsubscribe(id uint64) {
+func (w *updateWatcher) unsubscribe(id uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	delete(w.subs, id)
 }
 
-func (w *walWatcher) stop() {
+func (w *updateWatcher) stop() {
 	close(w.done)
 	w.wg.Wait()
+	w.db.Close()
 }
 
-func (w *walWatcher) poll() {
+func (w *updateWatcher) poll() {
 	defer w.wg.Done()
 
 	initDev, initIno, _ := fileIdentity(w.dbPath)
@@ -256,7 +269,7 @@ func (w *walWatcher) poll() {
 	}
 }
 
-func (w *walWatcher) fire() {
+func (w *updateWatcher) fire() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, ch := range w.subs {
@@ -515,22 +528,22 @@ func (q *Queue) SweepExpired() (int64, error) {
 	return n, err
 }
 
-// ClaimWaker returns a waker that blocks on WAL commits until a job
+// ClaimWaker returns a waker that blocks on database updates until a job
 // is claimable.
 func (q *Queue) ClaimWaker() *ClaimWaker {
-	subID, ch := q.db.wal.subscribe()
+	subID, ch := q.db.updates.subscribe()
 	return &ClaimWaker{
-		q:     q,
-		subID: subID,
-		walCh: ch,
+		q:        q,
+		subID:    subID,
+		updateCh: ch,
 	}
 }
 
-// ClaimWaker blocks until a job is claimable, waking on WAL commits.
+// ClaimWaker blocks until a job is claimable, waking on database updates.
 type ClaimWaker struct {
-	q     *Queue
-	subID uint64
-	walCh <-chan struct{}
+	q        *Queue
+	subID    uint64
+	updateCh <-chan struct{}
 }
 
 // Next blocks until a job is claimable, then claims and returns it.
@@ -544,27 +557,30 @@ func (w *ClaimWaker) Next(ctx context.Context, workerID string) (*Job, error) {
 		if job != nil {
 			return job, nil
 		}
-		select {
-		case <-ctx.Done():
+		nextAt, err := w.q.nextClaimAt()
+		if err != nil {
+			return nil, err
+		}
+		if nextAt > 0 && nextAt <= time.Now().Unix() {
+			continue
+		}
+		if !waitForUpdateOrDeadline(ctx, w.updateCh, nextAt) {
 			return nil, nil
-		case <-w.walCh:
-			// Recv-then-drain: coalesce bursts so we do one claim
-			// attempt per commit storm.
-			for {
-				select {
-				case <-w.walCh:
-				default:
-					goto drained
-				}
-			}
-		drained:
 		}
 	}
 }
 
-// Close unsubscribes from the WAL watcher.
+// Close unsubscribes from the update watcher.
 func (w *ClaimWaker) Close() {
-	w.q.db.wal.unsubscribe(w.subID)
+	w.q.db.updates.unsubscribe(w.subID)
+}
+
+func (q *Queue) nextClaimAt() (int64, error) {
+	var ts int64
+	err := q.db.db.QueryRow(
+		"SELECT honker_queue_next_claim_at(?)", q.name,
+	).Scan(&ts)
+	return ts, err
 }
 
 // -------------------------------------------------------------------
@@ -686,7 +702,7 @@ func (s *Stream) GetOffset(consumer string) (int64, error) {
 }
 
 // Subscribe returns a channel of stream events for a named consumer.
-// Resumes from saved offset, wakes on WAL commits, auto-saves offset
+// Resumes from saved offset, wakes on database updates, auto-saves offset
 // every 1000 events. Close on ctx cancel.
 func (s *Stream) Subscribe(ctx context.Context, consumer string) <-chan StreamEvent {
 	ch := make(chan StreamEvent, 16)
@@ -701,8 +717,8 @@ func (s *Stream) subscribeLoop(ctx context.Context, consumer string, ch chan<- S
 		return
 	}
 	lastSaved := offset
-	subID, walCh := s.db.wal.subscribe()
-	defer s.db.wal.unsubscribe(subID)
+	subID, updateCh := s.db.updates.subscribe()
+	defer s.db.updates.unsubscribe(subID)
 
 	for {
 		events, err := s.ReadSince(offset, 100)
@@ -727,10 +743,10 @@ func (s *Stream) subscribeLoop(ctx context.Context, consumer string, ch chan<- S
 		select {
 		case <-ctx.Done():
 			return
-		case <-walCh:
+		case <-updateCh:
 			for {
 				select {
-				case <-walCh:
+				case <-updateCh:
 				default:
 					goto drained
 				}
@@ -773,7 +789,7 @@ func (d *Database) Scheduler() *Scheduler {
 	return &Scheduler{db: d}
 }
 
-// Scheduler manages cron-scheduled tasks with leader election.
+// Scheduler manages time-triggered tasks with leader election.
 type Scheduler struct {
 	db *Database
 }
@@ -782,6 +798,13 @@ type Scheduler struct {
 type ScheduledTask struct {
 	Name     string
 	Queue    string
+	// Schedule is the canonical recurring schedule expression.
+	// It accepts:
+	//   - 5-field cron
+	//   - 6-field cron
+	//   - @every <n><unit> like "@every 1s"
+	Schedule string
+	// Cron is a backward-compatible alias for Schedule.
 	Cron     string
 	Payload  any
 	Priority int64
@@ -796,15 +819,19 @@ type ScheduledFire struct {
 	JobID  int64  `json:"job_id"`
 }
 
-// Add registers a cron task. Idempotent by name.
+// Add registers a recurring task. Idempotent by name.
 func (s *Scheduler) Add(task ScheduledTask) error {
 	payloadJSON, err := json.Marshal(task.Payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
+	expr := task.Schedule
+	if expr == "" {
+		expr = task.Cron
+	}
 	_, err = s.db.db.Exec(
 		"SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
-		task.Name, task.Queue, task.Cron, string(payloadJSON),
+		task.Name, task.Queue, expr, string(payloadJSON),
 		task.Priority, task.ExpiresS,
 	)
 	return err
@@ -850,6 +877,8 @@ func (s *Scheduler) Soonest() (int64, error) {
 func (s *Scheduler) Run(ctx context.Context, owner string) error {
 	const lockTTL = 60
 	const heartbeatInterval = 20 * time.Second
+	subID, updateCh := s.db.updates.subscribe()
+	defer s.db.updates.unsubscribe(subID)
 
 	for {
 		select {
@@ -863,15 +892,13 @@ func (s *Scheduler) Run(ctx context.Context, owner string) error {
 			return err
 		}
 		if lock == nil {
-			select {
-			case <-ctx.Done():
+			if !waitForUpdateOrDuration(ctx, updateCh, 5*time.Second) {
 				return ctx.Err()
-			case <-time.After(5 * time.Second):
 			}
 			continue
 		}
 
-		err = s.leaderLoop(ctx, lock, owner, lockTTL, heartbeatInterval)
+		err = s.leaderLoop(ctx, lock, owner, lockTTL, heartbeatInterval, updateCh)
 		_ = lock.Release()
 		if err != nil {
 			return err
@@ -879,16 +906,14 @@ func (s *Scheduler) Run(ctx context.Context, owner string) error {
 	}
 }
 
-func (s *Scheduler) leaderLoop(ctx context.Context, lock *Lock, owner string, lockTTL int64, heartbeatInterval time.Duration) error {
+func (s *Scheduler) leaderLoop(ctx context.Context, lock *Lock, owner string, lockTTL int64, heartbeatInterval time.Duration, updateCh <-chan struct{}) error {
 	lastHeartbeat := time.Now()
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		default:
 		}
 
 		_, err := s.Tick()
@@ -906,6 +931,69 @@ func (s *Scheduler) leaderLoop(ctx context.Context, lock *Lock, owner string, lo
 				return nil
 			}
 			lastHeartbeat = time.Now()
+		}
+
+		waitFor := heartbeatInterval
+		soonest, err := s.Soonest()
+		if err != nil {
+			return err
+		}
+		if soonest > 0 {
+			untilSoonest := time.Until(time.Unix(soonest, 0))
+			if untilSoonest < 0 {
+				untilSoonest = 0
+			}
+			if untilSoonest < waitFor {
+				waitFor = untilSoonest
+			}
+		}
+		if !waitForUpdateOrDuration(ctx, updateCh, waitFor) {
+			return nil
+		}
+	}
+}
+
+func waitForUpdateOrDeadline(ctx context.Context, updateCh <-chan struct{}, unixSec int64) bool {
+	if unixSec <= 0 {
+		return waitForUpdateOrDuration(ctx, updateCh, 0)
+	}
+	until := time.Until(time.Unix(unixSec, 0))
+	if until < 0 {
+		until = 0
+	}
+	return waitForUpdateOrDuration(ctx, updateCh, until)
+}
+
+func waitForUpdateOrDuration(ctx context.Context, updateCh <-chan struct{}, waitFor time.Duration) bool {
+	if waitFor <= 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			return true
+		}
+	}
+
+	timer := time.NewTimer(waitFor)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-updateCh:
+		drainUpdateCh(updateCh)
+		return true
+	case <-timer.C:
+		return true
+	}
+}
+
+func drainUpdateCh(updateCh <-chan struct{}) {
+	for {
+		select {
+		case <-updateCh:
+		default:
+			return
 		}
 	}
 }
@@ -1087,8 +1175,8 @@ func (d *Database) listenLoop(ctx context.Context, channel string, ch chan<- Not
 		return
 	}
 
-	subID, walCh := d.wal.subscribe()
-	defer d.wal.unsubscribe(subID)
+	subID, updateCh := d.updates.subscribe()
+	defer d.updates.unsubscribe(subID)
 
 	for {
 		rows, err := d.db.Query(
@@ -1117,10 +1205,10 @@ func (d *Database) listenLoop(ctx context.Context, channel string, ch chan<- Not
 		select {
 		case <-ctx.Done():
 			return
-		case <-walCh:
+		case <-updateCh:
 			for {
 				select {
-				case <-walCh:
+				case <-updateCh:
 				default:
 					goto drained
 				}
