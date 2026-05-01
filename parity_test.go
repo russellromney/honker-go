@@ -633,7 +633,7 @@ func TestClaimWakerWakesOnRunAtDeadline(t *testing.T) {
 	defer db.Close()
 
 	q := db.Queue("runat", QueueOptions{})
-	runAt := time.Now().Unix() + 1
+	runAt := time.Now().Add(2 * time.Second).Unix()
 	if _, err := q.Enqueue(map[string]any{"x": 1}, EnqueueOptions{RunAt: &runAt}); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
@@ -652,11 +652,16 @@ func TestClaimWakerWakesOnRunAtDeadline(t *testing.T) {
 		t.Fatal("expected job from waker")
 	}
 	elapsed := time.Since(start)
-	if elapsed < 700*time.Millisecond {
-		t.Fatalf("run_at wake came too early: %v", elapsed)
+	expected := time.Until(time.Unix(runAt, 0))
+	minElapsed := expected - 250*time.Millisecond
+	if minElapsed < 0 {
+		minElapsed = 0
 	}
-	if elapsed > 2500*time.Millisecond {
-		t.Fatalf("run_at wake came too late: %v", elapsed)
+	if elapsed < minElapsed {
+		t.Fatalf("run_at wake came too early: %v (expected about %v)", elapsed, expected)
+	}
+	if elapsed > expected+2500*time.Millisecond {
+		t.Fatalf("run_at wake came too late: %v (expected about %v)", elapsed, expected)
 	}
 	job.Ack()
 }
