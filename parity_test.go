@@ -298,7 +298,7 @@ func TestScheduler(t *testing.T) {
 	sched := db.Scheduler()
 
 	if err := sched.Add(ScheduledTask{
-		Name: "test", Queue: "q", Cron: "0 * * * *",
+		Name: "test", Queue: "q", Schedule: "0 * * * *",
 		Payload: map[string]any{"x": 1}, Priority: 0,
 	}); err != nil {
 		t.Fatalf("add: %v", err)
@@ -341,7 +341,7 @@ func TestSchedulerRun(t *testing.T) {
 
 	sched := db.Scheduler()
 	if err := sched.Add(ScheduledTask{
-		Name: "runtest", Queue: "q", Cron: "0 * * * *",
+		Name: "runtest", Queue: "q", Schedule: "0 * * * *",
 		Payload: map[string]any{"x": 1},
 	}); err != nil {
 		t.Fatalf("add: %v", err)
@@ -353,6 +353,32 @@ func TestSchedulerRun(t *testing.T) {
 	err = sched.Run(ctx, "owner-1")
 	if err != context.DeadlineExceeded {
 		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+}
+
+func TestSchedulerAcceptsLegacyCronAlias(t *testing.T) {
+	extPath := findExtension(t)
+	dbPath := filepath.Join(t.TempDir(), "t.db")
+	db, err := Open(dbPath, extPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	sched := db.Scheduler()
+	if err := sched.Add(ScheduledTask{
+		Name: "legacy", Queue: "q", Cron: "@every 1s",
+		Payload: map[string]any{"ok": true},
+	}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	soonest, err := sched.Soonest()
+	if err != nil {
+		t.Fatalf("soonest: %v", err)
+	}
+	if soonest == 0 {
+		t.Fatal("expected non-zero soonest")
 	}
 }
 
@@ -646,9 +672,9 @@ func TestSchedulerAcceptsEverySecondExpression(t *testing.T) {
 
 	sched := db.Scheduler()
 	if err := sched.Add(ScheduledTask{
-		Name:    "fast",
-		Queue:   "beats",
-		Cron:    "@every 1s",
+		Name:     "fast",
+		Queue:    "beats",
+		Schedule: "@every 1s",
 		Payload: map[string]any{"ok": true},
 	}); err != nil {
 		t.Fatalf("add: %v", err)

@@ -789,7 +789,7 @@ func (d *Database) Scheduler() *Scheduler {
 	return &Scheduler{db: d}
 }
 
-// Scheduler manages cron-scheduled tasks with leader election.
+// Scheduler manages time-triggered tasks with leader election.
 type Scheduler struct {
 	db *Database
 }
@@ -798,6 +798,13 @@ type Scheduler struct {
 type ScheduledTask struct {
 	Name     string
 	Queue    string
+	// Schedule is the canonical recurring schedule expression.
+	// It accepts:
+	//   - 5-field cron
+	//   - 6-field cron
+	//   - @every <n><unit> like "@every 1s"
+	Schedule string
+	// Cron is a backward-compatible alias for Schedule.
 	Cron     string
 	Payload  any
 	Priority int64
@@ -812,15 +819,19 @@ type ScheduledFire struct {
 	JobID  int64  `json:"job_id"`
 }
 
-// Add registers a cron task. Idempotent by name.
+// Add registers a recurring task. Idempotent by name.
 func (s *Scheduler) Add(task ScheduledTask) error {
 	payloadJSON, err := json.Marshal(task.Payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
+	expr := task.Schedule
+	if expr == "" {
+		expr = task.Cron
+	}
 	_, err = s.db.db.Exec(
 		"SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
-		task.Name, task.Queue, task.Cron, string(payloadJSON),
+		task.Name, task.Queue, expr, string(payloadJSON),
 		task.Priority, task.ExpiresS,
 	)
 	return err

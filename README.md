@@ -114,7 +114,11 @@ Durable pub/sub with per-consumer offsets.
 
 ### `(*Database).Scheduler() *Scheduler`
 
-Cron-style periodic tasks.
+Recurring schedules. Use the `Schedule` field for:
+
+- 5-field cron
+- 6-field cron
+- `@every <n><unit>` like `@every 1s`
 
 The underlying SQLite handle is also available through `db.Raw()` for direct SQL access.
 
