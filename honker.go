@@ -557,20 +557,15 @@ func (w *ClaimWaker) Next(ctx context.Context, workerID string) (*Job, error) {
 		if job != nil {
 			return job, nil
 		}
-		select {
-		case <-ctx.Done():
+		nextAt, err := w.q.nextClaimAt()
+		if err != nil {
+			return nil, err
+		}
+		if nextAt > 0 && nextAt <= time.Now().Unix() {
+			continue
+		}
+		if !waitForUpdateOrDeadline(ctx, w.updateCh, nextAt) {
 			return nil, nil
-		case <-w.updateCh:
-			// Recv-then-drain: coalesce bursts so we do one claim
-			// attempt per commit storm.
-			for {
-				select {
-				case <-w.updateCh:
-				default:
-					goto drained
-				}
-			}
-		drained:
 		}
 	}
 }
@@ -578,6 +573,14 @@ func (w *ClaimWaker) Next(ctx context.Context, workerID string) (*Job, error) {
 // Close unsubscribes from the update watcher.
 func (w *ClaimWaker) Close() {
 	w.q.db.updates.unsubscribe(w.subID)
+}
+
+func (q *Queue) nextClaimAt() (int64, error) {
+	var ts int64
+	err := q.db.db.QueryRow(
+		"SELECT honker_queue_next_claim_at(?)", q.name,
+	).Scan(&ts)
+	return ts, err
 }
 
 // -------------------------------------------------------------------
@@ -863,6 +866,8 @@ func (s *Scheduler) Soonest() (int64, error) {
 func (s *Scheduler) Run(ctx context.Context, owner string) error {
 	const lockTTL = 60
 	const heartbeatInterval = 20 * time.Second
+	subID, updateCh := s.db.updates.subscribe()
+	defer s.db.updates.unsubscribe(subID)
 
 	for {
 		select {
@@ -876,15 +881,13 @@ func (s *Scheduler) Run(ctx context.Context, owner string) error {
 			return err
 		}
 		if lock == nil {
-			select {
-			case <-ctx.Done():
+			if !waitForUpdateOrDuration(ctx, updateCh, 5*time.Second) {
 				return ctx.Err()
-			case <-time.After(5 * time.Second):
 			}
 			continue
 		}
 
-		err = s.leaderLoop(ctx, lock, owner, lockTTL, heartbeatInterval)
+		err = s.leaderLoop(ctx, lock, owner, lockTTL, heartbeatInterval, updateCh)
 		_ = lock.Release()
 		if err != nil {
 			return err
@@ -892,16 +895,14 @@ func (s *Scheduler) Run(ctx context.Context, owner string) error {
 	}
 }
 
-func (s *Scheduler) leaderLoop(ctx context.Context, lock *Lock, owner string, lockTTL int64, heartbeatInterval time.Duration) error {
+func (s *Scheduler) leaderLoop(ctx context.Context, lock *Lock, owner string, lockTTL int64, heartbeatInterval time.Duration, updateCh <-chan struct{}) error {
 	lastHeartbeat := time.Now()
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		default:
 		}
 
 		_, err := s.Tick()
@@ -919,6 +920,69 @@ func (s *Scheduler) leaderLoop(ctx context.Context, lock *Lock, owner string, lo
 				return nil
 			}
 			lastHeartbeat = time.Now()
+		}
+
+		waitFor := heartbeatInterval
+		soonest, err := s.Soonest()
+		if err != nil {
+			return err
+		}
+		if soonest > 0 {
+			untilSoonest := time.Until(time.Unix(soonest, 0))
+			if untilSoonest < 0 {
+				untilSoonest = 0
+			}
+			if untilSoonest < waitFor {
+				waitFor = untilSoonest
+			}
+		}
+		if !waitForUpdateOrDuration(ctx, updateCh, waitFor) {
+			return nil
+		}
+	}
+}
+
+func waitForUpdateOrDeadline(ctx context.Context, updateCh <-chan struct{}, unixSec int64) bool {
+	if unixSec <= 0 {
+		return waitForUpdateOrDuration(ctx, updateCh, 0)
+	}
+	until := time.Until(time.Unix(unixSec, 0))
+	if until < 0 {
+		until = 0
+	}
+	return waitForUpdateOrDuration(ctx, updateCh, until)
+}
+
+func waitForUpdateOrDuration(ctx context.Context, updateCh <-chan struct{}, waitFor time.Duration) bool {
+	if waitFor <= 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			return true
+		}
+	}
+
+	timer := time.NewTimer(waitFor)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-updateCh:
+		drainUpdateCh(updateCh)
+		return true
+	case <-timer.C:
+		return true
+	}
+}
+
+func drainUpdateCh(updateCh <-chan struct{}) {
+	for {
+		select {
+		case <-updateCh:
+		default:
+			return
 		}
 	}
 }
